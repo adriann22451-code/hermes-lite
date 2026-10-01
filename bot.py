@@ -1,9 +1,11 @@
-import os, subprocess, pathlib, requests, anthropic
+import os, json, subprocess, pathlib, requests
+from openai import OpenAI
 
 TG = f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}"
 OWNER = int(os.environ["OWNER_ID"])  # hanya kamu yang boleh memakai bot
-MODEL = os.environ.get("MODEL", "claude-sonnet-5-5")
-client = anthropic.Anthropic()  # baca ANTHROPIC_API_KEY dari env
+MODEL = os.environ["MODEL"]  # contoh: openai/gpt-4o-mini (harus mendukung tool calling)
+client = OpenAI(base_url=os.environ.get("BASE_URL", "https://openrouter.ai/api/v1"),
+                api_key=os.environ["API_KEY"])
 
 DATA = pathlib.Path(os.environ.get("DATA_DIR", "data"))
 (DATA / "skills").mkdir(parents=True, exist_ok=True)
@@ -72,10 +74,11 @@ HANDLERS = {"save_memory": save_memory, "write_skill": write_skill,
 
 
 def tool(name, desc, props):
-    return {"name": name, "description": desc,
-            "input_schema": {"type": "object", "required": list(props),
-                             "properties": {k: {"type": "string", "description": v}
-                                            for k, v in props.items()}}}
+    return {"type": "function", "function": {
+        "name": name, "description": desc,
+        "parameters": {"type": "object", "required": list(props),
+                       "properties": {k: {"type": "string", "description": v}
+                                      for k, v in props.items()}}}}
 
 
 TOOLS = [
@@ -102,25 +105,25 @@ def system():
 
 
 def run(user_text):
-    msgs = history[-20:] + [{"role": "user", "content": user_text}]
+    msgs = ([{"role": "system", "content": system()}] + history[-20:]
+            + [{"role": "user", "content": user_text}])
     for _ in range(12):  # batas langkah agar tidak loop tanpa henti
-        r = client.messages.create(model=MODEL, max_tokens=2000, system=system(),
-                                   tools=TOOLS, messages=msgs)
-        msgs.append({"role": "assistant", "content": r.content})
-        calls = [b for b in r.content if b.type == "tool_use"]
-        if not calls:
-            answer = "".join(b.text for b in r.content if b.type == "text")
+        r = client.chat.completions.create(model=MODEL, messages=msgs, tools=TOOLS,
+                                           max_tokens=2000)
+        m = r.choices[0].message
+        msgs.append(m.model_dump(exclude_none=True))
+        if not m.tool_calls:
+            answer = m.content or ""
             history.append({"role": "user", "content": user_text})
             history.append({"role": "assistant", "content": answer})
             return answer
-        results = []
-        for c in calls:
+        for c in m.tool_calls:
             try:
-                out = HANDLERS[c.name](**c.input)
+                args = json.loads(c.function.arguments or "{}")
+                out = HANDLERS[c.function.name](**args)
             except Exception as e:
                 out = f"error: {e}"
-            results.append({"type": "tool_result", "tool_use_id": c.id, "content": str(out)})
-        msgs.append({"role": "user", "content": results})
+            msgs.append({"role": "tool", "tool_call_id": c.id, "content": str(out)})
     return "Berhenti: terlalu banyak langkah."
 
 
